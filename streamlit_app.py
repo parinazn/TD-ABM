@@ -1,254 +1,293 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
-import networkx as nx
 import matplotlib.pyplot as plt
-from pyvis.network import Network
-import streamlit.components.v1 as components
-import tempfile
-import os
-import random
+import networkx as nx
+import pandas as pd
+from main_multiplex import NetworkModel, ModelType, State
 
-from main_simulations import ViralNetworkModel, State, ModelType
+st.set_page_config(page_title="Multiplex Diffusion Sim", layout="wide")
 
-st.set_page_config(page_title="Agent-Based Network Simulation", layout="wide")
-st.title("🕸️ Spread of Information on Networks")
+# --- CSS FOR STYLING ---
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 15px;
+        border-radius: 10px;
+        text-align: center;
+    }
+    div[data-testid="stSidebarUserContent"] {
+        padding-top: 2rem;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# =======================================================
-# 1. NETWORK & SEED CONFIGURATION
-# =======================================================
-st.sidebar.header("1. Network Configuration")
+# --- SIDEBAR CONFIGURATION ---
+st.sidebar.title("⚙️ Simulation Settings")
 
-# --- NETWORK SOURCE ---
-source_type = st.sidebar.radio("Source:", ["Synthetic (Watts-Strogatz)", "Upload CSV"])
+# 1. Global Network Settings
+st.sidebar.header("1. Global Network Params")
 
-preview_graph = None
+num_nodes = st.sidebar.slider(
+    "Number of Nodes", 10, 200, 50, 10, 
+    help="The total population size (number of agents) in the network."
+)
 
-if source_type == "Upload CSV":
-    uploaded_file = st.sidebar.file_uploader("Upload Edge List (CSV)", type=["csv"])
-    if uploaded_file:
-        df = pd.read_csv(uploaded_file, header=None, names=["source", "target"])
-        G_raw = nx.from_pandas_edgelist(df, "source", "target")
-        preview_graph = nx.convert_node_labels_to_integers(G_raw)
-        st.sidebar.success(f"Loaded {preview_graph.number_of_nodes()} nodes.")
-else:
-    use_fixed_seed = st.sidebar.checkbox("Use Fixed Seed", value=True)
-    # --- SEED CONTROL ---
-    if use_fixed_seed:
-        graph_seed = st.sidebar.number_input("Seed Value", min_value=0, value=42)
-    else:
-        # Note on "Random" Mode: We use session_state to hold the graph structure constant
-        # until the user specifically asks for a new one.
-        if "random_seed" not in st.session_state:
-            st.session_state.random_seed = random.randint(0, 10000)
-        
-        if st.sidebar.button("🎲 Generate New Random Graph"):
-            st.session_state.random_seed = random.randint(0, 10000)
-            
-        graph_seed = st.session_state.random_seed
-        st.sidebar.caption(f"Graph Structure Seed: {graph_seed}")
-    num_nodes = st.sidebar.slider("Nodes", 10, 200, 50)
-    avg_degree = st.sidebar.slider("Avg Degree", 2, 10, 4)
-    rewiring_prob = st.sidebar.slider("Rewiring Probability", 0.0, 1.0, 0.1)
-    
-    # Generate Preview Graph
-    preview_graph = nx.watts_strogatz_graph(n=num_nodes, k=avg_degree, p=rewiring_prob, seed=graph_seed)
+max_steps = st.sidebar.slider(
+    "Max Steps", 10, 200, 50, 10,
+    help="How long the simulation runs. One step includes potential updates for both layers depending on timing."
+)
 
-# =======================================================
-# 2. PATIENT ZERO SELECTION
-# =======================================================
+graph_seed = st.sidebar.number_input(
+    "Graph Topology Seed", value=42,
+    help="Fixes the random layout of the network connections. Same seed = same network structure every time."
+)
+
 st.sidebar.markdown("---")
-st.sidebar.header("2. Seed Node Selection")
 
-seed_method = st.sidebar.radio("Selection Method", ["Random", "Manual (Targeted)"])
-fixed_seeds = None
-initial_outbreak = 1
+# 2. Seeding Strategy
+st.sidebar.header("2. Seeding Strategy")
+seeding_strategy = st.sidebar.selectbox(
+    "Infection Strategy", 
+    ["random", "degree", "betweenness"],
+    help="""
+    How 'Patient Zero' is chosen:
+    - **Random**: Picks any node arbitrarily.
+    - **Degree**: Picks the most connected nodes (hubs).
+    - **Betweenness**: Picks nodes that bridge different communities (bridges).
+    """
+)
 
-if seed_method == "Random":
-    initial_outbreak = st.sidebar.slider("Random Initial Seeds", 1, 10, 1)
-else:
-    # Analyze the Preview Graph
-    degrees = dict(preview_graph.degree())
-    node_options = sorted(preview_graph.nodes(), key=lambda x: degrees[x], reverse=True)
-    node_labels = {n: f"Node {n} (Conn: {degrees[n]})" for n in node_options}
-    
-    selected_indices = st.sidebar.multiselect(
-        "Select Specific Nodes:",
-        options=node_options,
-        format_func=lambda x: node_labels[x],
-        default=[node_options[0]] if node_options else None
+initial_outbreak = st.sidebar.slider(
+    "Initial Outbreak Size", 1, 20, 1,
+    help="The number of agents infected at Step 0."
+)
+
+infected_node_seed = None
+if seeding_strategy == "random":
+    infected_node_seed = st.sidebar.number_input(
+        "Infection RNG Seed", value=42,
+        help="Controls the randomness of WHICH specific nodes get infected when using 'Random' strategy."
     )
-    fixed_seeds = selected_indices
-    st.sidebar.info(f"Selected {len(fixed_seeds)} seeds.")
 
-# =======================================================
-# 3. MODEL CONFIGURATION
-# =======================================================
 st.sidebar.markdown("---")
-st.sidebar.header("3. Spreading Rules")
 
-model_choice = st.sidebar.selectbox("Model", [m.value for m in ModelType])
-selected_model_enum = next(m for m in ModelType if m.value == model_choice)
-
-recovery_prob = 0.0
-threshold = 2
-spread_prob = 0.3
-
-if selected_model_enum == ModelType.SI:
-    spread_prob = st.sidebar.slider("Spread Chance", 0.0, 1.0, 0.3)
-elif selected_model_enum == ModelType.SIS:
-    spread_prob = st.sidebar.slider("Spread Chance", 0.0, 1.0, 0.3)
-    recovery_prob = st.sidebar.slider("Recovery Chance", 0.0, 1.0, 0.1)
-elif selected_model_enum == ModelType.THRESHOLD:
-    threshold = st.sidebar.slider("Threshold", 1, 5, 2)
-
-steps = st.sidebar.slider("Steps", 5, 100, 30)
-
-# =======================================================
-# 4. EXECUTION MODE
-# =======================================================
-st.sidebar.markdown("---")
-st.sidebar.header("4. Execution Mode")
-mode = st.sidebar.radio("Mode", ["Single Run (Visual)", "Batch Run (Scientific)"])
-
-if mode == "Batch Run (Scientific)":
-    num_runs = st.sidebar.number_input("Number of Runs", min_value=5, max_value=100, value=30)
-
-# =======================================================
-# MAIN RUN LOGIC
-# =======================================================
-st.sidebar.markdown("---")
-st.sidebar.header("5. Run Simulation")
-if st.sidebar.button("Run Simulation"):
+# 3. Layer Configuration Helper
+def layer_ui(layer_num, default_timing, default_model_index):
+    st.sidebar.header(f"3.{layer_num} Layer {layer_num} Configuration")
     
-    # Check if a graph exists
-    if preview_graph is None:
-        st.error("Please configure a network first.")
-    else:
-        # ---------------------------------------------------
-        # DETERMINING SIMULATION SEED
-        # ---------------------------------------------------
-        # If the user UNCHECKED "Fixed Seed", they expect the simulation 
-        # to vary every time they click Run, even if the graph structure 
-        # is held constant by the Session State.
-        if use_fixed_seed:
-            simulation_seed = graph_seed
-        else:
-            simulation_seed = None  # Randomize the spread dynamics
+    # --- A. Diffusion Model Choice ---
+    model_str = st.sidebar.selectbox(
+        f"L{layer_num} Diffusion Model", 
+        ["SI", "SIS", "Threshold"], 
+        index=default_model_index, 
+        key=f"mod_l{layer_num}",
+        help="""
+        **SI**: Simple Contagion. Once infected, stays infected. Good for information/rumors.
+        **SIS**: Flu-like. Agents can recover and become susceptible again.
+        **Threshold**: Complex Contagion. Requires 'k' infected neighbors to adopt. Good for behaviors/social norms.
+        """
+    )
+    
+    # Map string to Enum
+    model_enum = {
+        "SI": ModelType.SI,
+        "SIS": ModelType.SIS,
+        "Threshold": ModelType.THRESHOLD
+    }[model_str]
 
-        # ---------------------------------------------------
-        # MODE A: SINGLE RUN
-        # ---------------------------------------------------
-        if mode == "Single Run (Visual)":
-            model = ViralNetworkModel(
-                num_nodes=preview_graph.number_of_nodes(),
-                avg_degree=0, # Ignored since we pass custom_graph
-                spread_prob=spread_prob,
-                initial_outbreak=initial_outbreak,
-                seed=simulation_seed, 
-                model_type=selected_model_enum,
-                recovery_prob=recovery_prob,
-                threshold=threshold,
-                custom_graph=preview_graph.copy(), # Pass a copy to be safe
-                fixed_seeds=fixed_seeds
-            )
+    # --- B. Model Specific Parameters ---
+    spread_prob = 0.0
+    recovery_prob = 0.0
+    threshold = 0
+    
+    if model_str in ["SI", "SIS"]:
+        spread_prob = st.sidebar.slider(
+            f"L{layer_num} Spread Prob", 0.0, 1.0, 0.1, 0.05, 
+            key=f"sp_l{layer_num}",
+            help="Probability (0-1) that an infected agent will successfully infect a susceptible neighbor in one step."
+        )
+    
+    if model_str == "SIS":
+        recovery_prob = st.sidebar.slider(
+            f"L{layer_num} Recovery Prob", 0.0, 1.0, 0.1, 0.05, 
+            key=f"rp_l{layer_num}",
+            help="Probability (0-1) that an infected agent recovers back to Susceptible state."
+        )
+        
+    if model_str == "Threshold":
+        threshold = st.sidebar.number_input(
+            f"L{layer_num} Threshold (#)", 1, 10, 2, 
+            key=f"th_l{layer_num}",
+            help="The strict number of infected neighbors required to trigger adoption. (e.g., I need 2 friends to buy it before I do)."
+        )
 
-            progress_bar = st.progress(0)
-            for i in range(steps):
-                model.step()
-                progress_bar.progress((i + 1) / steps)
+    # --- C. Network Topology & Timing ---
+    st.sidebar.caption(f"Layer {layer_num} Topology & Timing")
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        net_type = st.selectbox(
+            f"Type", ["watts_strogatz", "sbm"], 
+            key=f"net_l{layer_num}",
+            help="**Watts-Strogatz**: Small-world ring (high clustering).\n**SBM**: Stochastic Block Model (distinct communities)."
+        )
+        avg_deg = st.number_input(
+            f"Avg Degree", 1, 10, 3, 
+            key=f"deg_l{layer_num}",
+            help="Average number of connections per node."
+        )
+    with col2:
+        timing = st.number_input(
+            f"Timing Step", 1, 20, default_timing, 
+            key=f"time_l{layer_num}",
+            help="Timescale of this layer. 1 = Processes every step. 3 = Processes only every 3rd step (slower/offline layer)."
+        )
 
-            results_df = model.datacollector.get_model_vars_dataframe()
-            
-            col1, col2 = st.columns([1, 2])
-            with col1:
-                st.subheader("📊 Metrics")
-                st.write("Width (Count)")
-                st.line_chart(results_df["Width (Count)"])
-                st.write("Depth (Hops)")
-                st.line_chart(results_df["Depth (Hops)"])
-            
-            with col2:
-                st.subheader("🕸️ Final State")
-                net = Network(height="500px", width="100%", bgcolor="#222222", font_color="white")
-                pos = nx.spring_layout(model.G, seed=graph_seed) # Layout uses GRAPH seed
-                agent_by_pos = {a.pos: a for a in model.agents}
-                
-                for node_id in model.G.nodes():
-                    agent = agent_by_pos.get(node_id)
-                    color = "#00C0F2"
-                    size = 5
-                    if agent and agent.state == State.INFECTED:
-                        color = "#FF4B4B"
-                        if fixed_seeds and node_id in fixed_seeds:
-                            color = "#FFFF00"
-                            size = 10
-                    
-                    x_pos = pos[node_id][0] * 1000
-                    y_pos = pos[node_id][1] * 1000
-                    net.add_node(node_id, label=str(node_id), x=x_pos, y=y_pos, color=color, size=size)
-                
-                for edge in model.G.edges():
-                    net.add_edge(edge[0], edge[1], color="#555555")
+    st.sidebar.markdown("---")
 
-                net.toggle_physics(False)
+    return {
+        "network_type": net_type, "avg_degree": avg_deg, "timing": timing,
+        "model_type": model_enum, "spread_prob": spread_prob, 
+        "recovery_prob": recovery_prob, "threshold": threshold
+    }
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmpfile:
-                    path = tmpfile.name
-                try:
-                    net.save_graph(path)
-                    with open(path, 'r', encoding='utf-8') as f:
-                        html_data = f.read()
-                    components.html(html_data, height=550)
-                finally:
-                    if os.path.exists(path):
-                        os.remove(path)
+# Configure Layer 1 (Default: SI)
+l1_params = layer_ui(1, default_timing=1, default_model_index=0) 
 
-        # ---------------------------------------------------
-        # MODE B: BATCH RUN (SCIENTIFIC)
-        # ---------------------------------------------------
-        else:
-            all_runs_width = []
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            for r in range(num_runs):
-                status_text.text(f"Simulating Run {r+1}/{num_runs}...")
-                
-                model = ViralNetworkModel(
-                    num_nodes=preview_graph.number_of_nodes(),
-                    avg_degree=0,
-                    spread_prob=spread_prob,
-                    initial_outbreak=initial_outbreak,
-                    seed=None, # ALWAYS Random for Batch stats
-                    model_type=selected_model_enum,
-                    recovery_prob=recovery_prob,
-                    threshold=threshold,
-                    custom_graph=preview_graph.copy(), # Reuse fixed structure
-                    fixed_seeds=fixed_seeds
-                )
-                
-                for _ in range(steps):
-                    model.step()
-                
-                run_data = model.datacollector.get_model_vars_dataframe()["Width (Count)"].values
-                all_runs_width.append(run_data)
-                progress_bar.progress((r + 1) / num_runs)
-            
-            # Plotting
-            data_matrix = np.array(all_runs_width)
-            avg_curve = np.mean(data_matrix, axis=0)
-            std_curve = np.std(data_matrix, axis=0)
-            
-            st.subheader(f"📈 Aggregate Results ({num_runs} Runs)")
-            fig, ax = plt.subplots(figsize=(10, 5))
-            x = range(len(avg_curve))
-            ax.plot(x, avg_curve, label="Average Infection", color="blue", linewidth=2)
-            ax.fill_between(x, avg_curve - std_curve, avg_curve + std_curve, color="blue", alpha=0.2, label="Std Dev")
-            
-            ax.set_title(f"Spread Dynamics: {selected_model_enum.value}")
-            ax.set_xlabel("Time Steps")
-            ax.set_ylabel("Infected Count")
-            ax.legend()
-            ax.grid(True, linestyle="--", alpha=0.5)
+# Configure Layer 2 (Default: Threshold)
+l2_params = layer_ui(2, default_timing=3, default_model_index=2) 
+
+
+# --- MAIN APP LOGIC ---
+
+st.title("Multiplex Network Diffusion Simulator")
+st.markdown(f"**Current Setup:** Layer 1 is **{l1_params['model_type'].value}** | Layer 2 is **{l2_params['model_type'].value}** | Seeding: **{seeding_strategy.capitalize()}**")
+
+# Run Button
+if st.button("▶️ Run Simulation", type="primary"):
+    
+    # Initialize Model with new Seeding Parameters
+    model = NetworkModel(
+        num_nodes=num_nodes,
+        initial_outbreak=initial_outbreak,
+        seeding_strategy=seeding_strategy,
+        
+        # Layer 1
+        network1_type=l1_params["network_type"],
+        avg_degree1=l1_params["avg_degree"],
+        model1_type=l1_params["model_type"],
+        spread_prob1=l1_params["spread_prob"],
+        recovery_prob1=l1_params["recovery_prob"],
+        threshold1=l1_params["threshold"],
+        timing1=l1_params["timing"],
+
+        # Layer 2
+        network2_type=l2_params["network_type"],
+        avg_degree2=l2_params["avg_degree"],
+        model2_type=l2_params["model_type"],
+        spread_prob2=l2_params["spread_prob"],
+        recovery_prob2=l2_params["recovery_prob"],
+        threshold2=l2_params["threshold"],
+        timing2=l2_params["timing"],
+        
+        graph_seed=graph_seed,
+        infected_node_seed=infected_node_seed
+    )
+
+    # Run Loop
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i in range(max_steps):
+        model.step()
+        progress_bar.progress((i + 1) / max_steps)
+        status_text.text(f"Simulating Step {i+1}/{max_steps}")
+    
+    status_text.empty()
+    progress_bar.empty()
+    
+    # Collect Data
+    df = model.datacollector.get_model_vars_dataframe()
+    
+    # --- METRICS ROW ---
+    final_width = df["Overall Width"].iloc[-1]
+    max_depth_l1 = df["Depth L1 (Hops)"].max()
+    max_depth_l2 = df["Depth L2 (Hops)"].max()
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Infected Nodes", f"{final_width} / {num_nodes}", help="Total unique nodes infected across both layers")
+    col2.metric("Max Depth (Layer 1)", f"{max_depth_l1:.0f} hops", help="Furthest distance reached using only Layer 1 edges")
+    col3.metric("Max Depth (Layer 2)", f"{max_depth_l2:.0f} hops", help="Furthest distance reached using only Layer 2 edges")
+
+    # --- PLOTS ROW ---
+    tab1, tab2, tab3 = st.tabs(["📈 Time Series", "🕸️ Network Visualizer", "📄 Raw Data"])
+    
+    with tab1:
+        col_p1, col_p2 = st.columns(2)
+        
+        with col_p1:
+            st.subheader("Total Infections")
+            fig, ax = plt.subplots(figsize=(6, 4))
+            ax.plot(df.index, df["Overall Width"], label="Total Infected", color="#e63946", linewidth=2.5)
+            ax.set_xlabel("Step")
+            ax.set_ylabel("Count")
+            ax.set_title("Adoption Curve (Width)")
+            ax.grid(True, alpha=0.3)
             st.pyplot(fig)
+            
+        with col_p2:
+            st.subheader("Layer Penetration")
+            fig2, ax2 = plt.subplots(figsize=(6, 4))
+            ax2.plot(df.index, df["Depth L1 (Hops)"], label="Layer 1", linestyle="-", color="#1d3557", linewidth=2)
+            ax2.plot(df.index, df["Depth L2 (Hops)"], label="Layer 2", linestyle="--", color="#457b9d", linewidth=2)
+            ax2.set_xlabel("Step")
+            ax2.set_ylabel("Hops from Seed")
+            ax2.set_title("Spreading Depth")
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            st.pyplot(fig2)
+
+    with tab2:
+        st.subheader("Final Network State (Side-by-Side Layers)")
+        st.markdown("Same nodes, different connections. **Red** = Infected, **Teal** = Susceptible, **Gold** = Patient Zero.")
+        
+        # Helper to generate common color map
+        color_map = []
+        node_sizes = []
+        for agent in model.agents:
+            if agent.pos in model.initial_infected_ids:
+                color_map.append("#FFD700") # Gold for seeds
+                node_sizes.append(250)
+            elif agent.state == State.INFECTED:
+                color_map.append("#FF6B6B") # Red for infected
+                node_sizes.append(150)
+            else:
+                color_map.append("#4ECDC4") # Teal for susceptible
+                node_sizes.append(150)
+
+        # Create two columns for side-by-side graphs
+        col_g1, col_g2 = st.columns(2)
+
+        # --- LAYER 1 DRAWING ---
+        with col_g1:
+            st.caption(f"**Layer 1**: {l1_params['network_type']} ({l1_params['model_type'].value})")
+            fig1, ax1 = plt.subplots(figsize=(5, 5))
+            pos1 = nx.spring_layout(model.G1, seed=42)
+            nx.draw(model.G1, pos1, node_color=color_map, node_size=node_sizes, 
+                    edge_color="#cfcfcf", width=1.5, alpha=0.8, ax=ax1)
+            st.pyplot(fig1)
+
+        # --- LAYER 2 DRAWING ---
+        with col_g2:
+            st.caption(f"**Layer 2**: {l2_params['network_type']} ({l2_params['model_type'].value})")
+            fig2, ax2 = plt.subplots(figsize=(5, 5))
+            # Use a different layout calculation for G2 so its unique structure is visible
+            pos2 = nx.spring_layout(model.G2, seed=42) 
+            nx.draw(model.G2, pos2, node_color=color_map, node_size=node_sizes, 
+                    edge_color="#cfcfcf", width=1.5, alpha=0.8, ax=ax2)
+            st.pyplot(fig2)
+
+    with tab3:
+        st.dataframe(df)
+
+else:
+    st.info("👈 Configure settings in the sidebar and click **Run Simulation** to start.")
