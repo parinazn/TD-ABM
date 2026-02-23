@@ -2,7 +2,7 @@ import streamlit as st
 import matplotlib.pyplot as plt
 import networkx as nx
 import pandas as pd
-from main_multiplex import NetworkModel, ModelType, State
+from main_simulations import NetworkModel, ModelType, State
 
 st.set_page_config(page_title="Multiplex Diffusion Sim", layout="wide")
 
